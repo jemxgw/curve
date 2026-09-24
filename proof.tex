@@ -1,0 +1,381 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{hyperref}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\newcommand{\F}{\mathbb{F}}
+\newcommand{\Z}{\mathbb{Z}}
+\newcommand{\Oinf}{\mathcal{O}}
+
+\title{Correctness Proofs for the secp256k1 Arithmetic\\ Used in the \texttt{curve} Package}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+The \texttt{curve} package implements the elliptic curve secp256k1 together
+with ECDSA signing, verification and public-key recovery. Its implementation
+relies on several mathematical facts: square roots modulo $p$ can be computed by
+a single exponentiation, the map $(x,y)\mapsto(\beta x,y)$ is a group
+endomorphism that acts as multiplication by a scalar $\lambda$ (the basis of
+the GLV speed-up in \texttt{ScalarMult}), ECDSA verification accepts every
+honestly generated signature, and the public key can be recovered from a
+signature. We state and prove each of these facts.
+\end{abstract}
+
+\section{Setting}
+
+Throughout, let
+\begin{align*}
+p &= 2^{256} - 2^{32} - 977 \\
+  &= \texttt{0xFFFFFFFF\,FFFFFFFF\,FFFFFFFF\,FFFFFFFF\,FFFFFFFF\,FFFFFFFF\,FFFFFFFE\,FFFFFC2F},
+\end{align*}
+and let $E$ be the curve over the prime field $\F_p$ given by
+\[
+  E:\; y^2 = x^3 + 7 .
+\]
+We write $E(\F_p)$ for the set of solutions $(x,y)\in\F_p^2$ together with the
+point at infinity $\Oinf$. With the usual chord-and-tangent law, $E(\F_p)$ is an
+abelian group with identity $\Oinf$. We recall the affine formulas, which are
+the ones the Jacobian routines in \texttt{curve.go} implement after the change
+of coordinates $(X,Y,Z)\mapsto(X/Z^2,\,Y/Z^3)$.
+
+For $P_1=(x_1,y_1)$ and $P_2=(x_2,y_2)$ in $E(\F_p)\setminus\{\Oinf\}$:
+\begin{itemize}
+  \item $-P_1 = (x_1,-y_1)$;
+  \item if $P_2 = -P_1$ then $P_1+P_2=\Oinf$;
+  \item otherwise $P_1+P_2 = (x_3,y_3)$ with
+  \begin{equation}\label{eq:add}
+    x_3 = m^2 - x_1 - x_2,\qquad y_3 = m(x_1-x_3) - y_1,
+  \end{equation}
+  where
+  \begin{equation}\label{eq:slope}
+    m = \begin{cases}
+      \dfrac{y_2-y_1}{x_2-x_1}, & x_1\neq x_2,\\[2ex]
+      \dfrac{3x_1^2}{2y_1}, & P_1=P_2 .
+    \end{cases}
+  \end{equation}
+\end{itemize}
+
+The standard domain parameters (SEC~2, \S2.4.1) supply a base point
+$G=(G_x,G_y)\in E(\F_p)$ and the prime
+\[
+  n = \texttt{0xFFFFFFFF\,FFFFFFFF\,FFFFFFFF\,FFFFFFFE\,BAAEDCE6\,AF48A03B\,BFD25E8C\,D0364141},
+\]
+with the property that $\#E(\F_p) = n$, i.e.\ the cofactor is $h=1$
+(the package sets \texttt{H = 1}). We use the following elementary numerical
+facts, each of which is a direct computation on the constants above:
+\begin{equation}\label{eq:facts}
+  p \equiv 3 \pmod 4, \qquad p \equiv 1 \pmod 3, \qquad p < 2n .
+\end{equation}
+
+\section{The group structure}
+
+\begin{lemma}\label{lem:cyclic}
+$E(\F_p)$ is cyclic of prime order $n$. Every point $P\neq\Oinf$ has order $n$
+and generates $E(\F_p)$. In particular $nP=\Oinf$ for every $P\in E(\F_p)$.
+\end{lemma}
+
+\begin{proof}
+Let $P\neq\Oinf$. By Lagrange's theorem the order of $P$ divides
+$\#E(\F_p)=n$. Since $n$ is prime and $P\neq\Oinf$, the order of $P$ is $n$, so
+the cyclic subgroup $\langle P\rangle$ has $n$ elements and therefore equals
+$E(\F_p)$. The last claim follows because the order of every element divides
+$n$.
+\end{proof}
+
+\begin{corollary}\label{cor:no2torsion}
+No point of $E(\F_p)$ has $y$-coordinate $0$.
+\end{corollary}
+
+\begin{proof}
+If $P=(x,0)\in E(\F_p)$ then $-P=(x,-0)=P$, so $2P=\Oinf$ and the order of $P$
+divides $2$. By Lemma~\ref{lem:cyclic} the order of $P$ is $n$, which is an odd
+prime. Contradiction.
+\end{proof}
+
+\begin{remark}
+Corollary~\ref{cor:no2torsion} guarantees that the doubling slope
+$3x_1^2/(2y_1)$ in \eqref{eq:slope} is always defined, and
+Lemma~\ref{lem:cyclic} shows that the check ``$nR=\Oinf$'' in step~1.4 of
+\texttt{recoverKeyFromSignature} always succeeds for points on the curve; it is
+kept only as a defensive test.
+\end{remark}
+
+\section{Square roots and point decompression}
+
+The package computes $q = (p+1)/4$ (\texttt{QPlus1Div4}) in order to take square
+roots, which is needed to decompress a point from its $x$-coordinate.
+
+\begin{theorem}\label{thm:sqrt}
+Let $q=(p+1)/4$ and $a\in\F_p$, and put $c = a^{q}$. Then
+\begin{enumerate}
+  \item if $a$ is a square in $\F_p$, then $c^2 = a$;
+  \item if $a$ is not a square in $\F_p$, then $c^2 = -a \neq a$.
+\end{enumerate}
+Consequently $a$ is a square if and only if $c^2=a$, and in that case the
+square roots of $a$ are exactly $\pm c$.
+\end{theorem}
+
+\begin{proof}
+Since $p\equiv 3 \pmod 4$ by \eqref{eq:facts}, $q$ is an integer. If $a=0$ then
+$c=0$ and both claims are trivial, so assume $a\neq 0$. Then
+\[
+  c^2 = a^{(p+1)/2} = a\cdot a^{(p-1)/2}.
+\]
+By Euler's criterion, $a^{(p-1)/2}=1$ if $a$ is a nonzero square and
+$a^{(p-1)/2}=-1$ otherwise. This gives $c^2=a$ in the first case and $c^2=-a$
+in the second. Since $p$ is odd and $a\neq0$, $-a\neq a$.
+
+For the last sentence: over the field $\F_p$ the polynomial $Y^2-a$ has at most
+two roots, and if $c^2=a$ then $c$ and $-c$ are roots.
+\end{proof}
+
+\begin{corollary}\label{cor:decompress}
+For $x\in\F_p$, there is a point of $E(\F_p)$ with $x$-coordinate $x$ if and only
+if $c=(x^3+7)^q$ satisfies $c^2 = x^3+7$. In that case there are exactly two such
+points, $(x,c)$ and $(x,p-c)$, and exactly one of $c$ and $p-c$ is odd.
+\end{corollary}
+
+\begin{proof}
+The first two claims follow from Theorem~\ref{thm:sqrt} applied to $a=x^3+7$,
+together with Corollary~\ref{cor:no2torsion}, which gives $c\neq0$ and so
+$c\neq -c$. Viewing $c$ as an integer in $[1,p-1]$, we have
+$c + (p-c) = p$, which is odd, so exactly one of the two summands is odd.
+\end{proof}
+
+Corollary~\ref{cor:decompress} is why a compressed public key needs only $x$
+and one parity bit.
+
+\section{The GLV endomorphism}
+
+\texttt{ScalarMult} splits a scalar $k$ as $k \equiv k_1 + k_2\lambda \pmod n$
+and computes $kP = k_1P + k_2\,\phi(P)$, where $\phi(x,y)=(\beta x, y)$. This
+section proves that the identity $\phi(P)=\lambda P$ behind that step is valid.
+
+\begin{lemma}\label{lem:beta}
+There exists $\beta\in\F_p$ with $\beta^3=1$ and $\beta\neq1$. Any such $\beta$
+satisfies $\beta^2+\beta+1=0$ and $\beta^{-1}=\beta^2$.
+\end{lemma}
+
+\begin{proof}
+The multiplicative group $\F_p^\times$ is cyclic of order $p-1$, and
+$3\mid p-1$ by \eqref{eq:facts}. A cyclic group has an element of every order
+dividing its size, so there is an element $\beta$ of order $3$. Then
+$0=\beta^3-1=(\beta-1)(\beta^2+\beta+1)$, and since $\beta\ne1$ it follows that
+$\beta^2+\beta+1=0$. Finally $\beta\cdot\beta^2=1$.
+\end{proof}
+
+The package's constant
+$\beta=\texttt{0x7AE96A2B\ldots719501EE}$ is such an element.
+
+\begin{definition}
+Fix $\beta$ as in Lemma~\ref{lem:beta}. Define $\phi:E(\F_p)\to E(\F_p)$ by
+$\phi(\Oinf)=\Oinf$ and $\phi(x,y) = (\beta x, y)$.
+\end{definition}
+
+The map is well defined because $(\beta x)^3+7=\beta^3x^3+7=x^3+7=y^2$.
+
+\begin{theorem}\label{thm:endo}
+$\phi$ is a group automorphism of $E(\F_p)$ with $\phi^3=\mathrm{id}$ and
+$\phi\ne\mathrm{id}$.
+\end{theorem}
+
+\begin{proof}
+\emph{Homomorphism.} We need $\phi(P_1+P_2)=\phi(P_1)+\phi(P_2)$. This is clear
+when either point is $\Oinf$. Let $P_i=(x_i,y_i)$ and write
+$P_i'=\phi(P_i)=(\beta x_i,y_i)$.
+
+\emph{Case $P_2=-P_1$.} Then $x_1=x_2$ and $y_2=-y_1$, so
+$P_2'=(\beta x_1,-y_1)=-P_1'$, and both sides equal $\Oinf$.
+
+\emph{Case $x_1\ne x_2$.} Then $\beta x_1\neq\beta x_2$, and the slope for
+$P_1'+P_2'$ is
+\[
+  m' = \frac{y_2-y_1}{\beta(x_2-x_1)} = \beta^{-1}m = \beta^2 m .
+\]
+By \eqref{eq:add} and $\beta^4=\beta$,
+\begin{align*}
+  x_3' &= m'^2 - \beta x_1 - \beta x_2 = \beta^4 m^2 - \beta(x_1+x_2)
+        = \beta\,(m^2-x_1-x_2) = \beta x_3,\\
+  y_3' &= m'(\beta x_1 - x_3') - y_1 = \beta^2 m\cdot\beta(x_1-x_3) - y_1
+        = m(x_1-x_3)-y_1 = y_3 .
+\end{align*}
+So $P_1'+P_2'=(\beta x_3,y_3)=\phi(P_1+P_2)$.
+
+\emph{Case $P_1=P_2$.} Here $y_1\ne0$ by Corollary~\ref{cor:no2torsion}, and the
+doubling slope for $P_1'$ is
+\[
+  m' = \frac{3(\beta x_1)^2}{2y_1} = \beta^2 m .
+\]
+This is the same relation between $m'$ and $m$ as in the previous case, and
+\eqref{eq:add} has the same form (with $x_2=x_1$), so the same computation
+gives $2P_1' = \phi(2P_1)$.
+
+\emph{Bijectivity and order.} Clearly
+$\phi^3(x,y)=(\beta^3x,y)=(x,y)$, so $\phi^3=\mathrm{id}$. Hence $\phi$ is a
+bijection with inverse $\phi^2$. Finally, $\phi(G)=(\beta G_x,G_y)\ne G$ because
+$\beta\ne1$ and $G_x\ne0$ (it is the explicit nonzero constant
+\texttt{0x79BE667E\ldots16F81798}). So
+$\phi\ne\mathrm{id}$.
+\end{proof}
+
+\begin{theorem}\label{thm:lambda}
+There is a unique $\lambda\in\Z/n\Z$ such that $\phi(P)=\lambda P$ for all
+$P\in E(\F_p)$. It satisfies $\lambda^3\equiv1$, $\lambda\not\equiv1$, and
+$\lambda^2+\lambda+1\equiv0 \pmod n$.
+\end{theorem}
+
+\begin{proof}
+By Lemma~\ref{lem:cyclic}, $G$ generates $E(\F_p)$, so $\phi(G)=\lambda G$ for
+some $\lambda\in\Z/n\Z$, which is unique because $G$ has order $n$. Any point
+can be written $P=kG$. Since $\phi$ is a homomorphism,
+\[
+  \phi(P) = \phi(kG) = k\,\phi(G) = k\lambda G = \lambda (kG) = \lambda P .
+\]
+Applying this three times, $P = \phi^3(P) = \lambda^3P$ for all $P$. Taking
+$P=G$ gives $\lambda^3\equiv1\pmod n$. Since $\phi\ne\mathrm{id}$,
+$\lambda\not\equiv1$. Now $n$ is prime, so $\Z/n\Z$ is a field, and
+$0=\lambda^3-1=(\lambda-1)(\lambda^2+\lambda+1)$ with $\lambda-1\neq0$ gives
+$\lambda^2+\lambda+1\equiv0$.
+\end{proof}
+
+\begin{remark}
+Theorem~\ref{thm:lambda} proves that \emph{some} $\lambda$ exists for the
+chosen $\beta$. The relation $\lambda^2+\lambda+1=0$ has exactly two roots mod
+$n$, and they correspond to the two choices of $\beta$ (namely $\beta$ and
+$\beta^2$). Which root goes with which $\beta$ is a finite check. For the
+constants in \texttt{initS256} one computes directly that
+$\lambda G = (\beta G_x, G_y)$, which by the proof above implies
+$\phi(P)=\lambda P$ for all $P$.
+\end{remark}
+
+\begin{corollary}[Correctness of the scalar split]\label{cor:glv}
+If $k\equiv k_1+k_2\lambda\pmod n$, then for every $P\in E(\F_p)$,
+\[
+  kP = k_1P + k_2\,\phi(P).
+\]
+\end{corollary}
+
+\begin{proof}
+By Lemma~\ref{lem:cyclic}, $nP=\Oinf$, so integer multiples of $P$ depend only on
+the scalar mod $n$. Hence
+$kP=(k_1+k_2\lambda)P = k_1P + k_2(\lambda P) = k_1P + k_2\phi(P)$.
+\end{proof}
+
+\section{ECDSA}
+
+Let $H$ be a hash function and let $e\in\Z/n\Z$ be the integer derived from
+$H(m)$ as in \texttt{hashToInt}. For a point $X\ne\Oinf$ we write $x(X)$ for its
+$x$-coordinate, viewed as an integer in $[0,p-1]$.
+
+\begin{definition}[ECDSA]
+A private key is $d\in\{1,\dots,n-1\}$, with public key $Q=dG$.
+\begin{description}
+\item[Sign.] Choose a nonce $k\in\{1,\dots,n-1\}$ (the package derives it
+deterministically by RFC~6979). Set $R=kG$ and $r = x(R)\bmod n$, and
+$s = k^{-1}(e+rd)\bmod n$. If $r=0$ or $s=0$, choose another $k$. Output
+$(r,s)$.
+\item[Verify.] Given $(r,s)$ with $r,s\in\{1,\dots,n-1\}$, compute
+$w=s^{-1}\bmod n$, $u_1=ew$, $u_2=rw$ and $X=u_1G+u_2Q$. Accept if and only if
+$X\ne\Oinf$ and $x(X)\bmod n = r$.
+\end{description}
+\end{definition}
+
+\begin{theorem}[Completeness of ECDSA]\label{thm:ecdsa}
+Every signature produced by the signing algorithm is accepted by the
+verification algorithm.
+\end{theorem}
+
+\begin{proof}
+Let $(r,s)$ be produced with nonce $k$, so $R=kG$ and $sk\equiv e+rd\pmod n$.
+Since $s\not\equiv0$ and $n$ is prime, $w=s^{-1}$ exists. All scalars may be
+reduced mod $n$ by Lemma~\ref{lem:cyclic}. Therefore
+\[
+  X = u_1G + u_2Q = ewG + rw\,dG = w(e+rd)G = w\,(sk)\,G = kG = R .
+\]
+Because $1\le k\le n-1$ and $G$ has order $n$, $R\ne\Oinf$. Finally
+$x(X)\bmod n = x(R)\bmod n = r$, so the signature is accepted.
+\end{proof}
+
+\section{Public-key recovery}
+
+\texttt{recoverKeyFromSignature} reconstructs $Q$ from $(r,s)$, $e$ and a small
+index $i$. It sets $x_R = r + \lfloor i/2\rfloor n$, lifts $x_R$ to a point $R$
+using Corollary~\ref{cor:decompress} (choosing the $y$-coordinate by the
+parity of $i$), and returns
+\[
+  Q' = r^{-1}(sR - eG).
+\]
+
+\begin{theorem}[Correctness of key recovery]\label{thm:recover}
+Let $(r,s)$ be an ECDSA signature on $e$ under the key $Q=dG$ with nonce $k$,
+and let $R=kG$. Then:
+\begin{enumerate}
+  \item $x(R)\in\{r,\;r+n\}$, so $R$ is one of at most four candidates produced
+        by the indices $i\in\{0,1,2,3\}$;
+  \item for the candidate equal to $R$, the procedure returns $Q'=Q$;
+  \item for \emph{every} candidate $R^\ast\in E(\F_p)\setminus\{\Oinf\}$ with
+        $x(R^\ast)\equiv r\pmod n$, the returned key $Q^\ast=r^{-1}(sR^\ast-eG)$
+        is one under which $(r,s)$ passes verification.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+(1) By definition $r\equiv x(R)\pmod n$ with $0\le x(R)<p$. Since $p<2n$ by
+\eqref{eq:facts}, $x(R)=r+jn$ with $j\in\{0,1\}$. For each of these two
+$x$-values Corollary~\ref{cor:decompress} gives at most two points, one of each
+$y$-parity, for four candidates in total.
+
+(2) From $sk\equiv e+rd \pmod n$ we get $sk-e\equiv rd$. Since
+$1\le r\le n-1$, $r$ is invertible mod $n$, and by Lemma~\ref{lem:cyclic},
+\[
+  Q' = r^{-1}(sR - eG) = r^{-1}(sk - e)G = r^{-1}(rd)G = dG = Q .
+\]
+
+(3) Let $w=s^{-1}$. Running verification with the key $Q^\ast$ gives
+\[
+  X = ewG + rw\,Q^\ast = ewG + rw\,r^{-1}(sR^\ast - eG)
+    = ewG + R^\ast - ewG = R^\ast .
+\]
+So $X=R^\ast\ne\Oinf$ and $x(X)\bmod n = x(R^\ast)\bmod n = r$, and the
+signature is accepted.
+\end{proof}
+
+\begin{remark}
+Part~(3) explains why recovery by itself cannot single out the signer's key.
+Up to four keys are consistent with a given signature. \texttt{SignCompact}
+therefore stores the index $i$ of the correct candidate in the header byte,
+and \texttt{RecoverCompact} uses it to pick that candidate.
+\end{remark}
+
+\section*{Summary}
+
+\begin{center}
+\begin{tabular}{ll}
+\hline
+Code & Result used \\
+\hline
+Doubling in \texttt{curve.go} & Corollary~\ref{cor:no2torsion} ($y\ne0$) \\
+\texttt{QPlus1Div4}, \texttt{DecompressPoint} & Theorem~\ref{thm:sqrt}, Corollary~\ref{cor:decompress} \\
+\texttt{ScalarMult} (\texttt{splitK}, $\beta$, $\lambda$) & Theorems~\ref{thm:endo}, \ref{thm:lambda}, Corollary~\ref{cor:glv} \\
+\texttt{Signature.Verify} & Theorem~\ref{thm:ecdsa} \\
+\texttt{recoverKeyFromSignature}, \texttt{RecoverCompact} & Theorem~\ref{thm:recover} \\
+\hline
+\end{tabular}
+\end{center}
+
+\end{document}
